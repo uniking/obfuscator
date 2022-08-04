@@ -10,13 +10,11 @@
 
 package me.superblaubeere27.jobf.processors.name;
 
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.PrintStream;
 import java.lang.reflect.Modifier;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Random;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
@@ -31,12 +29,11 @@ import me.superblaubeere27.jobf.utils.values.DeprecationLevel;
 import me.superblaubeere27.jobf.utils.values.EnabledValue;
 import me.superblaubeere27.jobf.utils.values.StringValue;
 import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Handle;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.commons.ClassRemapper;
 import org.objectweb.asm.commons.Remapper;
-import org.objectweb.asm.tree.ClassNode;
-import org.objectweb.asm.tree.FieldNode;
-import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.*;
 
 @Slf4j(topic = "obfuscator")
 public class NameObfuscation implements INameObfuscationProcessor {
@@ -44,15 +41,20 @@ public class NameObfuscation implements INameObfuscationProcessor {
     private static final Random random = new Random();
     private final EnabledValue enabled = new EnabledValue(PROCESSOR_NAME, DeprecationLevel.OK, false);
     private final StringValue excludedClasses = new StringValue(PROCESSOR_NAME, "Excluded classes", null, DeprecationLevel.GOOD, "me.name.Class\nme.name.*\nio.netty.**", 5);
+    private final StringValue includedClasses = new StringValue(PROCESSOR_NAME, "Included classes", null, DeprecationLevel.GOOD, "me.name.Class\nme.name.*\nio.netty.**", 5);
     private final StringValue excludedMethods = new StringValue(PROCESSOR_NAME, "Excluded methods", null, DeprecationLevel.GOOD, "me.name.Class.method\nme.name.Class**\nme.name.Class.*", 5);
     private final StringValue excludedFields = new StringValue(PROCESSOR_NAME, "Excluded fields", null, DeprecationLevel.GOOD, "me.name.Class.field\nme.name.Class.*\nme.name.**", 5);
-    private final BooleanValue shouldPackage = new BooleanValue(PROCESSOR_NAME, "Package", DeprecationLevel.OK, false);
+    private final BooleanValue shouldPackage = new BooleanValue(PROCESSOR_NAME, "Package", DeprecationLevel.OK, true);
+
     private final StringValue newPackage = new StringValue(PROCESSOR_NAME, "New Packages", null, DeprecationLevel.GOOD, "", 5);
     private final BooleanValue acceptMissingLibraries = new BooleanValue(PROCESSOR_NAME, "Accept Missing Libraries", DeprecationLevel.GOOD, false);
     private List<String> packageNames;
     private final List<Pattern> excludedClassesPatterns = new ArrayList<>();
+    private final List<Pattern> includedClassesPatterns = new ArrayList<>();
     private final List<Pattern> excludedMethodsPatterns = new ArrayList<>();
     private final List<Pattern> excludedFieldsPatterns = new ArrayList<>();
+
+    private final boolean keepPackageName = true;
 
     public void setupPackages() {
         if (shouldPackage.getObject()) {
@@ -82,6 +84,15 @@ public class NameObfuscation implements INameObfuscationProcessor {
         return "";
     }
 
+    public String getPackageName(String className){
+        String[] ss = className.split("/");
+        String packagename = "";
+        for (int i=0; i<ss.length-1; ++i){
+            packagename = packagename + ss[i] + "/";
+        }
+        return packagename;
+    }
+
     private void putMapping(HashMap<String, String> mappings, String str, String str1) {
         mappings.put(str, str1);
     }
@@ -95,12 +106,18 @@ public class NameObfuscation implements INameObfuscationProcessor {
 
             List<ClassWrapper> classWrappers = new ArrayList<>();
 
+            for (String s : includedClasses.getObject().split("\n")) {
+                includedClassesPatterns.add(compileExcludePattern(s));
+            }
             for (String s : excludedClasses.getObject().split("\n")) {
                 excludedClassesPatterns.add(compileExcludePattern(s));
             }
             for (String s : excludedMethods.getObject().split("\n")) {
                 excludedMethodsPatterns.add(compileExcludePattern(s));
             }
+            //内置不能被混淆的方法
+            excludedMethodsPatterns.add(compileExcludePattern(".*\\.values||.*\\.valueOf||.*\\.equals||.*\\.toString||.*\\.wait||.*\\.finalize"));
+
             for (String s : excludedFields.getObject().split("\n")) {
                 excludedFieldsPatterns.add(compileExcludePattern(s));
             }
@@ -132,17 +149,25 @@ public class NameObfuscation implements INameObfuscationProcessor {
                     if ((Modifier.isPrivate(method.methodNode.access) || Modifier.isProtected(method.methodNode.access)) && excluded)
                         continue;
 
-                    method.methodNode.access &= ~Opcodes.ACC_PRIVATE;
-                    method.methodNode.access &= ~Opcodes.ACC_PROTECTED;
-                    method.methodNode.access |= Opcodes.ACC_PUBLIC;
+                    if(!keepPackageName){
+                        method.methodNode.access &= ~Opcodes.ACC_PRIVATE;
+                        method.methodNode.access &= ~Opcodes.ACC_PROTECTED;
+                        method.methodNode.access |= Opcodes.ACC_PUBLIC;
+                    }
+
+
                 }
                 for (FieldWrapper field : classWrapper.fields) {
                     if ((Modifier.isPrivate(field.fieldNode.access) || Modifier.isProtected(field.fieldNode.access)) && excluded)
                         continue;
 
-                    field.fieldNode.access &= ~Opcodes.ACC_PRIVATE;
-                    field.fieldNode.access &= ~Opcodes.ACC_PROTECTED;
-                    field.fieldNode.access |= Opcodes.ACC_PUBLIC;
+                    if(!keepPackageName){
+                        field.fieldNode.access &= ~Opcodes.ACC_PRIVATE;
+                        field.fieldNode.access &= ~Opcodes.ACC_PROTECTED;
+                        field.fieldNode.access |= Opcodes.ACC_PUBLIC;
+                    }
+
+
                 }
 
                 AtomicBoolean nativeMethodsFound = new AtomicBoolean(false);
@@ -176,26 +201,32 @@ public class NameObfuscation implements INameObfuscationProcessor {
 
                 if (excluded || nativeMethodsFound.get()) return;
 
-                classWrapper.classNode.access &= ~Opcodes.ACC_PRIVATE;
-                classWrapper.classNode.access &= ~Opcodes.ACC_PROTECTED;
-                classWrapper.classNode.access |= Opcodes.ACC_PUBLIC;
+                if(!keepPackageName){
+                    classWrapper.classNode.access &= ~Opcodes.ACC_PRIVATE;
+                    classWrapper.classNode.access &= ~Opcodes.ACC_PROTECTED;
+                    classWrapper.classNode.access |= Opcodes.ACC_PUBLIC;
+                }
 
-                putMapping(mappings, classWrapper.originalName, getPackageName() + NameUtils.generateClassName());
+
+                if(keepPackageName)
+                    putMapping(mappings, classWrapper.originalName, getPackageName(classWrapper.originalName) + NameUtils.generateClassName());
+                else
+                    putMapping(mappings, classWrapper.originalName, getPackageName() + NameUtils.generateClassName());
                 classCounter.incrementAndGet();
             });
 
-//        try {
-//            FileOutputStream outStream = new FileOutputStream("mappings.txt");
-//            PrintStream printStream = new PrintStream(outStream);
-//
-//            for (Map.Entry<String, String> stringStringEntry : mappings.entrySet()) {
-//                printStream.println(stringStringEntry.getKey() + " -> " + stringStringEntry.getValue());
-//            }
-//
-//            outStream.close();
-//        } catch (IOException e) {
-//            e.printStackTrace();
-//        }
+        try {
+            FileOutputStream outStream = new FileOutputStream("mappings.txt");
+            PrintStream printStream = new PrintStream(outStream);
+
+            for (Map.Entry<String, String> stringStringEntry : mappings.entrySet()) {
+                printStream.println(stringStringEntry.getKey() + " -> " + stringStringEntry.getValue());
+            }
+
+            outStream.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
 
 
             log.info(String.format("... Finished generating mappings (%s)", Utils.formatTime(System.currentTimeMillis() - current)));
@@ -213,19 +244,23 @@ public class NameObfuscation implements INameObfuscationProcessor {
                 for (int i = 0; i < copy.methods.size(); i++) {
                     classWrapper.methods.get(i).methodNode = copy.methods.get(i);
 
-                    /*for (AbstractInsnNode insn : methodNode.instructions.toArray()) { // TODO: Fix lambdas + interface
-                        if (insn instanceof InvokeDynamicInsnNode) {
-                            InvokeDynamicInsnNode indy = (InvokeDynamicInsnNode) insn;
-                            if (indy.bsm.getOwner().equals("java/lang/invoke/LambdaMetafactory")) {
-                                Handle handle = (Handle) indy.bsmArgs[1];
-                                String newName = mappings.get(handle.getOwner() + '.' + handle.getName() + handle.getDesc());
-                                if (newName != null) {
-                                    indy.name = newName;
-                                    indy.bsm = new Handle(handle.getTag(), handle.getOwner(), newName, handle.getDesc(), false);
-                                }
-                            }
-                        }
-                    }*/
+//                    for(MethodWrapper methodWrapper : classWrapper.methods){
+//                        MethodNode methodNode = methodWrapper.methodNode;
+//                        for (AbstractInsnNode insn : methodNode.instructions.toArray()) { // TODO: Fix lambdas + interface
+//                            if (insn instanceof InvokeDynamicInsnNode) {
+//                                InvokeDynamicInsnNode indy = (InvokeDynamicInsnNode) insn;
+//                                if (indy.bsm.getOwner().equals("java/lang/invoke/LambdaMetafactory")) {
+//                                    Handle handle = (Handle) indy.bsmArgs[1];
+//                                    String newName = mappings.get(handle.getOwner() + '.' + handle.getName() + handle.getDesc());
+//                                    if (newName != null) {
+//                                        indy.name = newName;
+//                                        indy.bsm = new Handle(handle.getTag(), handle.getOwner(), newName, handle.getDesc(), false);
+//                                    }
+//                                }
+//                            }
+//                        }
+//                    }
+
                 }
 
                 if (copy.fields != null) {
@@ -251,6 +286,7 @@ public class NameObfuscation implements INameObfuscationProcessor {
 
             log.info(String.format("... Finished applying mappings (%s)", Utils.formatTime(System.currentTimeMillis() - current)));
         } finally {
+            includedClassesPatterns.clear();
             excludedClassesPatterns.clear();
             excludedMethodsPatterns.clear();
             excludedFieldsPatterns.clear();
@@ -259,27 +295,30 @@ public class NameObfuscation implements INameObfuscationProcessor {
     }
 
     private Pattern compileExcludePattern(String s) {
-        StringBuilder sb = new StringBuilder();
-        // s.replace('.', '/').replace("**", ".*").replace("*", "[^/]*")
-
-        char[] chars = s.toCharArray();
-
-        for (int i = 0; i < chars.length; i++) {
-            char c = chars[i];
-
-            if (c == '*') {
-                if (chars.length - 1 != i && chars[i + 1] == '*') {
-                    sb.append(".*");
-                    i++;
-                } else {
-                    sb.append("[^/]*");
-                }
-            } else if (c == '.') {
-                sb.append('/');
-            } else {
-                sb.append(c);
-            }
-        }
+//        StringBuilder sb = new StringBuilder();
+//        // s.replace('.', '/').replace("**", ".*").replace("*", "[^/]*")
+//
+//        char[] chars = s.toCharArray();
+//
+//        for (int i = 0; i < chars.length; i++) {
+//            char c = chars[i];
+//
+//            if (c == '*') {
+//                if (chars.length - 1 != i && chars[i + 1] == '*') {
+//                    sb.append(".*");
+//                    i++;
+//                } else {
+//                    sb.append("[^/]*");
+//                }
+//            } else if (c == '.') {
+//                sb.append('/');
+//            } else if(c == '\\'){
+//                sb.append(chars[++i]);
+//            }else {
+//                sb.append(c);
+//            }
+//        }
+        String sb = s;
 
         return Pattern.compile(sb.toString());
     }
@@ -287,38 +326,69 @@ public class NameObfuscation implements INameObfuscationProcessor {
     private boolean isClassExcluded(ClassWrapper classWrapper) {
         String str = classWrapper.classNode.name;
 
-        for (Pattern excludedMethodsPattern : excludedClassesPatterns) {
-            if (excludedMethodsPattern.matcher(str).matches()) {
-                log.info("Class '" + classWrapper.classNode.name + "' was excluded from name obfuscation by regex '" + excludedMethodsPattern.pattern() + "'");
-                return true;
+        for (Pattern includedMethodsPattern : includedClassesPatterns) {
+            if (includedMethodsPattern.matcher(str).matches()) {
+
+                for (Pattern excludedMethodsPattern : excludedClassesPatterns) {
+                    if (excludedMethodsPattern.matcher(str).matches()) {
+                        log.info("Class '" + classWrapper.classNode.name + "' was excluded from name obfuscation by regex '" + excludedMethodsPattern.pattern() + "'");
+                        return true;
+                    }
+                }
+
+                return false;
             }
         }
 
-        return false;
+        return true;
+
+//        for (Pattern excludedMethodsPattern : excludedClassesPatterns) {
+//            if (excludedMethodsPattern.matcher(str).matches()) {
+//                log.info("Class '" + classWrapper.classNode.name + "' was excluded from name obfuscation by regex '" + excludedMethodsPattern.pattern() + "'");
+//                return true;
+//            }
+//        }
+//
+//        return false;
     }
 
     private boolean isMethodExcluded(String owner, MethodWrapper methodWrapper) {
         String str = owner + '.' + methodWrapper.originalName;
 
-        for (Pattern excludedMethodsPattern : excludedMethodsPatterns) {
-            if (excludedMethodsPattern.matcher(str).matches()) {
-                return true;
+
+        for (Pattern includedMethodsPattern : includedClassesPatterns) {
+            if (includedMethodsPattern.matcher(str).matches()) {
+
+                for (Pattern excludedMethodsPattern : excludedMethodsPatterns) {
+                    if (excludedMethodsPattern.matcher(str).matches()) {
+                        return true;
+                    }
+                }
+
+                return false;
             }
         }
 
-        return false;
+        return true;
     }
 
     private boolean isFieldExcluded(String owner, FieldWrapper methodWrapper) {
         String str = owner + '.' + methodWrapper.originalName;
 
-        for (Pattern excludedMethodsPattern : excludedFieldsPatterns) {
-            if (excludedMethodsPattern.matcher(str).matches()) {
-                return true;
+        for (Pattern includedMethodsPattern : includedClassesPatterns) {
+            if (includedMethodsPattern.matcher(str).matches()) {
+
+                for (Pattern excludedMethodsPattern : excludedFieldsPatterns) {
+                    if (excludedMethodsPattern.matcher(str).matches()) {
+                        return true;
+                    }
+                }
+
+                return false;
             }
         }
 
-        return false;
+        return true;
     }
 
     private boolean canRenameMethodTree(HashMap<String, String> mappings, HashSet<ClassTree> visited, MethodWrapper methodWrapper, String owner) {

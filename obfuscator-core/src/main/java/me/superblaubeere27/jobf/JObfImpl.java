@@ -33,26 +33,11 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
-import java.util.zip.CRC32;
-import java.util.zip.Deflater;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipFile;
-import java.util.zip.ZipInputStream;
-import java.util.zip.ZipOutputStream;
+import java.util.zip.*;
 
 import com.google.common.io.ByteStreams;
 import lombok.extern.slf4j.Slf4j;
-import me.superblaubeere27.jobf.processors.CrasherTransformer;
-import me.superblaubeere27.jobf.processors.HWIDProtection;
-import me.superblaubeere27.jobf.processors.HideMembers;
-import me.superblaubeere27.jobf.processors.InlineTransformer;
-import me.superblaubeere27.jobf.processors.InvokeDynamic;
-import me.superblaubeere27.jobf.processors.LineNumberRemover;
-import me.superblaubeere27.jobf.processors.NumberObfuscationTransformer;
-import me.superblaubeere27.jobf.processors.ReferenceProxy;
-import me.superblaubeere27.jobf.processors.ShuffleMembersTransformer;
-import me.superblaubeere27.jobf.processors.StaticInitializionTransformer;
-import me.superblaubeere27.jobf.processors.StringEncryptionTransformer;
+import me.superblaubeere27.jobf.processors.*;
 import me.superblaubeere27.jobf.processors.flowObfuscation.FlowObfuscator;
 import me.superblaubeere27.jobf.processors.name.ClassWrapper;
 import me.superblaubeere27.jobf.processors.name.INameObfuscationProcessor;
@@ -71,9 +56,9 @@ import me.superblaubeere27.jobf.utils.values.Configuration;
 import me.superblaubeere27.jobf.utils.values.ValueManager;
 import org.apache.commons.lang3.StringUtils;
 import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.ModifiedClassWriter;
-import org.objectweb.asm.tree.ClassNode;
-import org.objectweb.asm.tree.FrameNode;
+import org.objectweb.asm.tree.*;
 
 @Slf4j(topic = "obfuscator")
 public class JObfImpl {
@@ -92,6 +77,7 @@ public class JObfImpl {
     private List<File> libraryFiles;
     private int computeMode;
     private boolean invokeDynamic;
+    private boolean flattening;
     private final JObfSettings settings = new JObfSettings();
     private int threadCount = Math.max(1, Runtime.getRuntime().availableProcessors());
 
@@ -137,10 +123,11 @@ public class JObfImpl {
                 ClassWrapper superClass = classPath.get(classWrapper.classNode.superName);
 
                 if (superClass == null && !acceptMissingClass)
+                {
+                    System.out.println("superClass " + classWrapper.classNode.superName + " (referenced in " + classWrapper.classNode.name + ") is missing in the classPath.");
                     throw new MissingClassException(classWrapper.classNode.superName + " (referenced in " + classWrapper.classNode.name + ") is missing in the classPath.");
+                }
                 else if (superClass == null) {
-                    tree.missingSuperClass = true;
-
                     log.warn("Missing class: " + classWrapper.classNode.superName + " (No methods of subclasses will be remapped)");
                 } else {
                     buildHierarchy(superClass, classWrapper, acceptMissingClass);
@@ -156,8 +143,10 @@ public class JObfImpl {
                     tree.parentClasses.add(s);
                     ClassWrapper interfaceClass = classPath.get(s);
 
-                    if (interfaceClass == null && !acceptMissingClass)
+                    if (interfaceClass == null && !acceptMissingClass){
+                        System.out.println("interfaceClass " + s + " (referenced in " + classWrapper.classNode.name + ") is missing in the classPath.");
                         throw new MissingClassException(s + " (referenced in " + classWrapper.classNode.name + ") is missing in the classPath.");
+                    }
                     else if (interfaceClass == null) {
                         tree.missingSuperClass = true;
 
@@ -299,6 +288,7 @@ public class JObfImpl {
         processors.add(new Optimizer());
         processors.add(new InlineTransformer(this));
         processors.add(new InvokeDynamic());
+        processors.add(new Flattening());
 
         processors.add(new StringEncryptionTransformer(this));
         processors.add(new NumberObfuscationTransformer(this));
@@ -330,6 +320,61 @@ public class JObfImpl {
         this.script = script;
     }
 
+
+    public void copyFile(String srcFileName, String desFileName)
+    {
+        long size = 0;
+        try {
+            do {
+                File des = new File(desFileName);
+                if (des.exists()) {
+                    if(!des.delete()) {
+                        break;
+                    }
+                }
+
+                File inputFile = new File(srcFileName);
+                if(!inputFile.exists()){
+                    break;
+                }
+                size = inputFile.length();
+
+                FileInputStream fis = null;
+                fis = new FileInputStream(inputFile);
+                OutputStream sOut = new FileOutputStream(desFileName);
+
+                byte[] buffer = new byte[1024*1024*5];//500k
+                int len = 0;
+                long writeLen = 0;
+                while((len=fis.read(buffer)) != -1){
+                    writeLen += len;
+                    if(writeLen < size) {
+                        sOut.write(buffer, 0, len);
+                    } else if(writeLen == size)
+                    {
+                        sOut.write(buffer, 0, len);
+                        break;
+                    }
+                    else
+                    {//writeLen > size
+                        sOut.write(buffer, 0, len - (int)(writeLen -size));
+                        break;
+                    }
+                }
+
+                fis.close();
+                sOut.flush();
+                sOut.close();
+                des = null;
+                inputFile = null;
+            }while(false);
+
+        } catch (Exception e) {
+            // TODO Auto-generated catch block
+            e.printStackTrace();
+        }
+
+    }
     public void processJar(Configuration config) throws IOException {
         ZipInputStream inJar = null;
         ZipOutputStream outJar = null;
@@ -498,56 +543,73 @@ public class JObfImpl {
                             ClassNode cn = stringClassNodeEntry.getValue();
 
                             try {
-                                try {
 
-                                    computeMode = ModifiedClassWriter.COMPUTE_MAXS;
+                                boolean methodTooLarge = false;
 
-
-                                    if (script == null || script.isObfuscatorEnabled(cn)) {
-                                        log.info(String.format("[%s] (%s/%s), Processing %s", Thread.currentThread().getName(), processed, classes.size(), entryName));
-
-                                        for (IClassTransformer proc : processors) {
-                                            try {
-                                                proc.process(callback, cn);
-                                            } catch (Exception e) {
-                                                e.printStackTrace();
-                                            }
-                                        }
-                                    } else {
-                                        log.info(String.format("[%s] (%s/%s), Skipping %s", Thread.currentThread().getName(), processed, classes.size(), entryName));
+                                for(MethodNode mn : cn.methods){
+                                    int lenght = mn.instructions.toArray().length * 4;
+                                    if(lenght >= 65535){
+                                        methodTooLarge = true;
                                     }
+                                }
 
-                                    if (callback.isForceComputeFrames())
-                                        cn.methods.forEach(method -> Arrays.stream(method.instructions.toArray()).filter(abstractInsnNode -> abstractInsnNode instanceof FrameNode).forEach(abstractInsnNode -> method.instructions.remove(abstractInsnNode)));
+                                if((cn.version & '\uffff') < 50 || methodTooLarge){
+                                    ClassWriter cw = new ClassWriter(0);
+                                    cn.accept(cw);
+                                    entryData = cw.toByteArray();
+                                }else{
+                                    try {
+
+                                        computeMode = ModifiedClassWriter.COMPUTE_MAXS;
 
 
-                                    int mode = computeMode
-                                            | (callback.isForceComputeFrames() ? ModifiedClassWriter.COMPUTE_FRAMES : 0);
+                                        if (script == null || script.isObfuscatorEnabled(cn)) {
+                                            log.info(String.format("[%s] (%s/%s), Processing %s", Thread.currentThread().getName(), processed, classes.size(), entryName));
 
-                                    log.info(String.format("[%s] (%s/%s), Writing (computeMode = %s) %s", Thread.currentThread().getName(), processed, classes.size(), mode, entryName));
+                                            for (IClassTransformer proc : processors) {
+                                                try {
+                                                    proc.process(callback, cn);
+                                                } catch (Exception e) {
+                                                    e.printStackTrace();
+                                                }
+                                            }
+                                        } else {
+                                            log.info(String.format("[%s] (%s/%s), Skipping %s", Thread.currentThread().getName(), processed, classes.size(), entryName));
+                                        }
 
-                                    ModifiedClassWriter writer = new ModifiedClassWriter(
-                                            mode
+                                        if (callback.isForceComputeFrames())
+                                            cn.methods.forEach(method -> Arrays.stream(method.instructions.toArray()).filter(abstractInsnNode -> abstractInsnNode instanceof FrameNode).forEach(abstractInsnNode -> method.instructions.remove(abstractInsnNode)));
+
+
+                                        int mode = computeMode
+                                                | (callback.isForceComputeFrames() ? ModifiedClassWriter.COMPUTE_FRAMES : 0);
+
+                                        log.info(String.format("[%s] (%s/%s), Writing (computeMode = %s) %s", Thread.currentThread().getName(), processed, classes.size(), mode, entryName));
+
+                                        ModifiedClassWriter writer = new ModifiedClassWriter(
+                                                mode
 //                                            ModifiedClassWriter.COMPUTE_MAXS |
 //                                            ModifiedClassWriter.COMPUTE_FRAMES
-                                    );
-                                    cn.accept(writer);
+                                        );
+                                        cn.accept(writer);
 
-                                    entryData = writer.toByteArray();
-                                } catch (Throwable e) {
-                                    System.err.println("Error while writing " + entryName);
-                                    e.printStackTrace();
+                                        entryData = writer.toByteArray();
+                                    } catch (Throwable e) {
+                                        System.err.println("Error while writing " + entryName);
+                                        e.printStackTrace();
 //                                    if (e instanceof) {
 //
 //                                    }
-                                    ModifiedClassWriter writer = new ModifiedClassWriter(ModifiedClassWriter.COMPUTE_MAXS
-                                            //                            | ModifiedClassWriter.COMPUTE_FRAMES
-                                    );
-                                    cn.accept(writer);
+                                        ModifiedClassWriter writer = new ModifiedClassWriter(ModifiedClassWriter.COMPUTE_MAXS
+                                                //                            | ModifiedClassWriter.COMPUTE_FRAMES
+                                        );
+                                        cn.accept(writer);
 
 
-                                    entryData = writer.toByteArray();
+                                        entryData = writer.toByteArray();
+                                    }
                                 }
+
                                 try {
                                     if (Packager.INSTANCE.isEnabled()) {
                                         entryName = Packager.INSTANCE.encryptName(entryName.replace(".class", ""));
@@ -650,7 +712,28 @@ public class JObfImpl {
                 outJar.closeEntry();
                 log.info("... Finished after " + Utils.formatTime(System.currentTimeMillis() - startTime));
             }
-        } catch (InterruptedException ignored) {
+        }catch (ZipException ze){
+            String msg = ze.toString();
+            log.error(msg);
+
+            if (outJar != null) {
+                try {
+                    log.info("Finishing...");
+                    outJar.flush();
+                    outJar.close();
+                    log.info(">>> Processing completed. If you found a bug / if the output is invalid please open an issue at https://github.com/superblaubeere27/obfuscator/issues");
+                } catch (Exception e) {
+                    // ignore
+                }
+
+                outJar = null;
+            }
+
+            copyFile(config.getInput(), config.getOutput());
+        }
+        catch (Exception ignored) {
+            String msg = ignored.toString();
+            log.error(msg);
         } finally {
             classPath.clear();
             classes.clear();
